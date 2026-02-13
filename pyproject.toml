@@ -52,6 +52,3 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 exclude = ["tests*"]
-
-[build-system]
-requires = ["setuptools"]
