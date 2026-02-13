@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 [project]
 name = "pyannote-audio"
 description = "State-of-the-art speaker diarization toolkit"
@@ -53,3 +54,43 @@ packages = ["src/pyannote"]
 
 [dependency-groups]
 dev = ["ipykernel>=6.29.5"]
+=======
+[build-system]
+requires = [
+    "setuptools>=65.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyannote.audio"
+version = "0.0.0"  # placeholder, your setup.py writes the real version
+description = "Neural building blocks for speaker diarization"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+authors = [
+    { name = "Hervé Bredin", email = "herve.bredin@irit.fr" }
+]
+license = { text = "MIT" }
+keywords = ["audio", "diarization", "speaker recognition", "machine learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering"
+]
+dependencies = [
+    # Your requirements.txt lines here
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests*"]
+
+[build-system]
+requires = ["setuptools"]
+>>>>>>> speaker-embedding-optimizations
