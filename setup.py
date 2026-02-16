@@ -12,7 +12,7 @@ with open("requirements.txt", mode="r", encoding="utf-8") as f:
     requirements = f.read().splitlines()
 
 try:
-    require("setuptools>=38.3,<82.0.0")
+    require("setuptools<82.0.0")
 except VersionConflict:
     print("Error: version of setuptools is too old (<38.3)!")
     sys.exit(1)
