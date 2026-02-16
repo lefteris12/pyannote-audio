@@ -1,13 +1,13 @@
 [build-system]
 requires = [
-    "setuptools>=65.0,<82.0.0",
+    "setuptools>=65.0",
     "wheel"
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyannote.audio"
-version = "3.3.2"
+version = "0.0.0"  # placeholder, your setup.py writes the real version
 description = "Neural building blocks for speaker diarization"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
