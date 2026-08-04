@@ -1,27 +1,171 @@
-# Changelog
+# CHANGELOG
 
-## develop
+## Version 4.0.7 (2026-06-30)
+
+- fix(pipeline): add missing support for `subfolder` in `Pipeline.from_pretrained`
+- feat(pipeline): add basic support for (sequential) batch inference
+
+## Version 4.0.5 (2026-06-22)
+
+- improve(telemetry): reduce number of sent packages [@litdarya](https://github.com/litdarya)
+- feat(cli): add `--average-case` option to `optimize` command [@antoinelaurent](https://github.com/antoinelaurent)
+- fix(task): fix  `Task.prepare_data` to support saving preprocessors that produce `int` values in metadata [@lylyhan](http://github.com/lylyhan)
+
+## Version 4.0.4 (2026-02-07)
+
+- feat(sample): add transcription of sample file
+- setup: relax torch dependencies constraints
+- fix(pipeline): fix HF authentication for Speechbrain speaker embedding [@krisoye](https://github.com/krisoye)
+
+## Version 4.0.3 (2025-12-07)
+
+- feat(cli): add `--revision` option to most CLI commands
+- feat(util): add `Calibration.safe_transform` method (supports NaNs as well as any shape)
+- fix(model): fix `Model.from_pretrained` to support `lightning` 2.6+
+- setup: update `pyannote-database` dependency to `6.1+`
+
+## Version 4.0.2 (2025-11-19)
+
+- BREAKING(util): make `Binarize.__call__` return `string` tracks (instead of `int`) [@benniekiss](https://github.com/benniekiss/)
+- fix(torch): pin `torch`, `torchcodec`, and `torchaudio` versions to [avoid segmentation fault](https://github.com/meta-pytorch/torchcodec/issues/995) 
+- fix(pyannoteAI): update pyannoteAI wrapper to return both regular and exclusive diarization
+- feat(pipeline): add `Pipeline.cuda()` convenience method [@tkanarsky](https://github.com/tkanarsky/)
+- feat(pipeline): add `preload` option to base `Pipeline.__call__` to force preloading audio in memory ([@antoinelaurent](https://github.com/antoinelaurent/))
+- feat(cli): add option to apply pipeline on a directory of audio files
+- improve(util): make `permutate` faster thanks to vectorized cost function
+
+## Version 4.0.1 (2025-10-10)
+
+- feat: allow passing preloaded pipeline config to `get_pipeline`
+- setup: update `pyannoteai-sdk` dependency to `0.3.0`
+- fix: relax version constraint on `OpenTelemetry` dependencies
+- improve: warn (instead of raise) when passing unsupported arguments to speaker diarization pipeline
+
+## Version 4.0.0 (2025-09-29) 
+
+### TL;DR
+
+#### Improved speaker assignment and counting
+
+`pyannote/speaker-diarization-community-1` pretrained pipeline relies on VBx clustering instead of agglomerative hierarchical clustering (as suggested by [BUT Speech@FIT](https://speech.fit.vut.cz/) researchers [Petr Pálka](https://github.com/Selesnyan) and [Jiangyu Han](https://github.com/jyhan03)).
+
+#### *Exclusive* speaker diarization
+
+`pyannote/speaker-diarization-community-1` pretrained pipeline returns a new *exclusive* speaker diarization, on top of the regular speaker diarization.
+This is a feature which is [backported from our latest commercial model](https://www.pyannote.ai/blog/precision-2) that simplifies the reconciliation between fine-grained speaker diarization timestamps and (sometimes not so precise) transcription timestamps.
+
+```python
+from pyannote.audio import Pipeline
+pipeline = Pipeline.from_pretrained(
+    "pyannote/speaker-diarization-community-1", token="huggingface-access-token")
+output = pipeline("/path/to/conversation.wav")
+print(output.speaker_diarization)            # regular speaker diarization
+print(output.exclusive_speaker_diarization)  # exclusive speaker diarization
+```
+
+#### Faster training
+
+Metadata caching and optimized dataloaders make training on large scale datasets much faster.  
+This led to a 15x speed up on [pyannoteAI](https://www.pyannote.ai) internal large scale training.
+
+#### [pyannoteAI](https://www.pyannote.ai) premium speaker diarization
+
+Change one line of code to use [pyannoteAI](https://docs.pyannote.ai) premium models and enjoy **more accurate speaker diarization**.
+
+```diff
+from pyannote.audio import Pipeline
+pipeline = Pipeline.from_pretrained(
+-    "pyannote/speaker-diarization-community-1", token="huggingface-access-token")
++    "pyannote/speaker-diarization-precision-2, token="pyannoteAI-api-key")
+diarization = pipeline("/path/to/conversation.wav")
+```
+
+#### Offline (air-gapped) use
+
+Pipelines can now be stored alongside their internal models in the same repository, streamlining fully offline use.
+
+1. Accept `pyannote/speaker-diarization-community-1` pipeline [user agreement](https://hf.co/pyannote/speaker-diarization-community-1)
+2. Clone the pipeline repository from Huggingface (if prompted for a password, use a Huggingface access token with correct permissions)
+
+    ```bash
+    $ git lfs install
+    $ git clone https://hf.co/pyannote/speaker-diarization-community-1 /path/to/directory/pyannote-speaker-diarization-community-1
+    ```
+
+3. Enjoy!
+
+    ```python
+    # load pipeline from disk (works without internet connection)
+    from pyannote.audio import Pipeline
+    pipeline = Pipeline.from_pretrained('/path/to/directory/pyannote-speaker-diarization-community-1')
+
+    # run the pipeline locally on your computer
+    diarization = pipeline("audio.wav")
+    ```
+
+#### Telemetry
+
+With the optional telemetry feature in `pyannote.audio`, you can choose to send anonymous usage metrics to help the `pyannote` team improve the library.
 
 ### Breaking changes
 
+- BREAKING(io): remove support for `sox` and `soundfile` audio I/O backends (only `ffmpeg` or in-memory audio is supported)
+- BREAKING(setup): drop support to `Python` < 3.10
+- BREAKING(hub): rename `use_auth_token` to `token`
+- BREAKING(hub): drop support for `{pipeline_name}@{revision}` syntax in `Model.from_pretrained(...)` and `Pipeline.from_pretrained(...)` -- use new `revision` keyword argument instead
+- BREAKING(task): remove `OverlappedSpeechDetection` task (part of `SpeakerDiarization` task)
+- BREAKING(pipeline): remove `OverlappedSpeechDetection` and `Resegmentation` unmaintained pipelines (part of `SpeakerDiarization`)
+- BREAKING(cache): rely on `huggingface_hub` caching directory (`PYANNOTE_CACHE` is no longer used)
+- BREAKING(inference): `Inference` now only supports already instantiated models
 - BREAKING(task): drop support for `multilabel` training in `SpeakerDiarization` task
 - BREAKING(task): drop support for `warm_up` option in `SpeakerDiarization` task
 - BREAKING(task): drop support for `weigh_by_cardinality` option in `SpeakerDiarization` task
 - BREAKING(task): drop support for `vad_loss` option in `SpeakerDiarization` task
+- BREAKING(chore): switch to native namespace package
+- BREAKING(cli): remove deprecated `pyannote-audio-train` CLI
 
 ### New features
 
+- feat(io): switch from `torchaudio` to `torchcodec` for audio I/O
+- feat(pipeline): add support for VBx clustering ([@Selesnyan](https://github.com/Selesnyan) and [jyhan03](https://github.com/jyhan03))
+- feat(pyannoteAI): add wrapper around pyannoteAI SDK
+- improve(hub): add support for pipeline repos that also include underlying models
 - feat(clustering): add support for `k-means` clustering
 - feat(model): add `wav2vec_frozen` option to freeze/unfreeze `wav2vec` in `SSeRiouSS` architecture
 - feat(task): add support for manual optimization in `SpeakerDiarization` task
 - feat(utils): add `hidden` option to `ProgressHook`
 - feat(utils): add `FilterByNumberOfSpeakers` protocol files filter
+- feat(core): add `Calibration` class to calibrate logits/distances into probabilities
+- feat(metric): add `DetectionErrorRate`, `SegmentationErrorRate`, `DiarizationPrecision`, and `DiarizationRecall` metrics
+- feat(cli): add CLI to download, apply, benchmark, and optimize pipelines
+- feat(cli): add CLI to strip checkpoints to their bare inference minimum 
+ 
+### Improvements
+
+- improve(model): improve WavLM (un)freezing support for `SSeRiouSS` architecture ([@clement-pages](https://github.com/clement-pages/))
+- improve(task): improve `SpeakerDiarization` training with manual optimization ([@clement-pages](https://github.com/clement-pages/))
+- improve(train): speed up dataloaders
+- improve(setup): switch to `uv`
+- improve(setup): switch to `lightning` from `pytorch-lightning`
+- improve(utils): improve dependency check when loading pretrained models and/or pipeline
+- improve(utils): add option to skip dependency check
+- improve(utils): add option to load a pretrained model checkpoint from an `io.BytesIO` buffer
+- improve(pipeline): add option to load a pretrained pipeline from a `dict` ([@benniekiss](https://github.com/benniekiss/))
 
 ### Fixes
 
+- fix(model): improve WavLM (un)freezing support for `ToTaToNet` architecture ([@clement-pages](https://github.com/clement-pages/))
 - fix(separation): fix clipping issue in speech separation pipeline ([@joonaskalda](https://github.com/joonaskalda/))
 - fix(separation): fix alignment between separated sources and diarization ([@Lebourdais](https://github.com/Lebourdais/) and [@clement-pages](https://github.com/clement-pages/))
+- fix(separation): prevent leakage removal collar from being applied to diarization ([@clement-pages](https://github.com/clement-pages/))
+- fix(separation): fix `PixIT` training with manual optimization ([@clement-pages](https://github.com/clement-pages/))
 - fix(doc): fix link to pytorch ([@emmanuel-ferdman](https://github.com/emmanuel-ferdman/))
+- fix(task): fix corner case with small (<9) number of validation samples ([@antoinelaurent](https://github.com/antoinelaurent/))
+- fix(doc): fix default embedding in `SpeechSeparation` and `SpeakerDiarization` docstring ([@razi-tm](https://github.com/razi-tm/)).
+
+## Version 3.4.0 (2025-09-09)
+
+- setup: pin pyannote.{core,database,metrics,pipeline} dependencies as future releases of these packages will break the 3.x branch
 
 ## Version 3.3.2 (2024-09-11)
 
@@ -243,7 +387,7 @@ Providing `num_speakers` to [`pyannote/speaker-diarization-3.1`](https://hf.co/p
 ## Version 1.0 (2018-07-03)
 
 - chore: switch from keras to pytorch (with tensorboard support)
-- improve: faster & better traning (`AutoLR`, advanced learning rate schedulers, improved batch generators)
+- improve: faster & better training (`AutoLR`, advanced learning rate schedulers, improved batch generators)
 - feat: add tunable speaker diarization pipeline (with its own tutorial)
 - chore: drop support for Python 2 (use Python 3.6 or later)
 
