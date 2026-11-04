@@ -38,7 +38,11 @@ from einops import rearrange
 from pyannote.audio import Audio, Inference, Model, Pipeline
 from pyannote.audio.core.io import AudioFile
 from pyannote.audio.pipelines.clustering import Clustering
-from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+from pyannote.audio.pipelines.speaker_verification import (
+    PretrainedSpeakerEmbedding,
+    PyannoteAudioPretrainedSpeakerEmbedding,
+    SpeechBrainPretrainedSpeakerEmbedding,
+)
 from pyannote.audio.pipelines.utils import (
     PipelineModel,
     PipelinePLDA,
@@ -210,6 +214,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         clustering: str = "VBxClustering",
         embedding_batch_size: int = 1,
         segmentation_batch_size: int = 1,
+        embedding_dtype: Text = "float32",
         der_variant: Optional[dict] = None,
         token: Union[Text, None] = None,
         cache_dir: Union[Path, Text, None] = None,
@@ -226,6 +231,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         self.embedding = embedding
         self.embedding_batch_size = embedding_batch_size
         self.embedding_exclude_overlap = embedding_exclude_overlap
+        self.embedding_dtype = embedding_dtype
 
         self.plda = plda
         self._plda = get_plda(plda, token=token, cache_dir=cache_dir)
@@ -259,7 +265,10 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
 
         else:
             self._embedding = PretrainedSpeakerEmbedding(
-                self.embedding, token=token, cache_dir=cache_dir
+                self.embedding,
+                token=token,
+                cache_dir=cache_dir,
+                dtype=self.embedding_dtype,
             )
             self._audio = Audio(sample_rate=self._embedding.sample_rate, mono="downmix")
             metric = self._embedding.metric
@@ -396,19 +405,18 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                 binary_segmentations.data, binary_segmentations.sliding_window
             )
 
-        def iter_waveform_and_mask():
+        def iter_waveform_and_mask(sort=False):
+            # BSI optimization: collect all (chunk, mask) elements first so we can
+            # optionally length-sort them, and track each element's chunk index
+            # (for waveform de-duplication) and global sample index (to scatter
+            # results back into the right slot regardless of ordering).
+            elements = []
+
             for (chunk, masks), (_, clean_masks) in zip(
                 binary_segmentations, clean_segmentations
             ):
                 # chunk: Segment(t, t + duration)
                 # masks: (num_frames, local_num_speakers) np.ndarray
-
-                waveform, _ = self._audio.crop(
-                    file,
-                    chunk,
-                    mode="pad",
-                )
-                # waveform: (1, num_samples) torch.Tensor
 
                 # mask may contain NaN (in case of partial stitching)
                 masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
@@ -422,43 +430,103 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                     else:
                         used_mask = mask
 
-                    yield waveform[None], torch.from_numpy(used_mask)[None]
-                    # w: (1, 1, num_samples) torch.Tensor
-                    # m: (1, num_frames) torch.Tensor
+                    num_el = np.sum(used_mask)
+                    N = len(elements)
+                    elements.append((chunk, used_mask, num_el, N // num_speakers, N))
+
+            # For SpeechBrain embeddings, sort by mask length so short signals are
+            # zero-padded together (not against long ones), saving compute.
+            if sort:
+                elements.sort(key=lambda x: x[2], reverse=True)
+
+            # Crop each chunk's waveform only once and reuse it across that
+            # chunk's speaker masks (cropping re-decodes audio from disk, so
+            # cropping per (chunk, speaker) would cost num_speakers x the I/O).
+            # When not sorting, equal chunks are contiguous so a single-entry
+            # "evict on change" cache is enough and keeps memory O(1); this
+            # reproduces upstream's crop-once-per-chunk behaviour.
+            last_chunk, last_waveform = None, None
+            for chunk, mask, _, chunk_num, sample_num in elements:
+                if chunk != last_chunk:
+                    last_waveform, _ = self._audio.crop(
+                        file,
+                        chunk,
+                        mode="pad",
+                    )
+                    last_chunk = chunk
+                # waveform: (1, num_samples) torch.Tensor
+
+                yield last_waveform[None], torch.from_numpy(mask)[None], chunk_num, sample_num
+                # w: (1, 1, num_samples) torch.Tensor
+                # m: (1, num_frames) torch.Tensor
+
+        # Length-sort only helps SpeechBrain (variable-length signals). For the
+        # pyannote/WeSpeaker path we instead keep chunk order so waveforms sharing
+        # a chunk stay contiguous and can be de-duplicated via `repeat_masks`.
+        sort = isinstance(self._embedding, SpeechBrainPretrainedSpeakerEmbedding)
 
         batches = batchify(
-            iter_waveform_and_mask(),
+            iter_waveform_and_mask(sort),
             batch_size=self.embedding_batch_size,
             fillvalue=(None, None),
         )
 
         batch_count = math.ceil(num_chunks * num_speakers / self.embedding_batch_size)
 
-        embedding_batches = []
-
         if hook is not None:
             hook("embeddings", None, total=batch_count, completed=0)
 
+        # Pre-fill every (chunk, speaker) slot with the "empty mask" embedding
+        # (all-zero weights -> NaN, as upstream). Slots whose mask is non-empty
+        # get overwritten below; empty ones are skipped entirely (not run).
+        zero_embedding = self._embedding(
+            torch.randn(1, 1, int(duration * self._embedding.sample_rate)),
+            torch.zeros(1, int(num_frames)),
+        )[0]
+
+        embedding_batches = np.repeat(
+            zero_embedding[None],
+            repeats=num_chunks * num_speakers,
+            axis=0,
+        )
+
         for i, batch in enumerate(batches, 1):
-            waveforms, masks = zip(*filter(lambda b: b[0] is not None, batch))
+            waveforms, masks, chunk_idx, sample_idx = zip(
+                *filter(lambda b: b[0] is not None, batch)
+            )
 
-            waveform_batch = torch.vstack(waveforms)
             # (batch_size, 1, num_samples) torch.Tensor
-
-            mask_batch = torch.vstack(masks)
+            waveform_batch = torch.vstack(waveforms)
             # (batch_size, num_frames) torch.Tensor
+            mask_batch = torch.vstack(masks)
+            chunk_idx_batch = torch.tensor(chunk_idx)
+            sample_idx_batch = torch.tensor(sample_idx)
+
+            # skip empty masks (they keep the pre-filled NaN embedding)
+            mask = torch.where(mask_batch.sum(-1) > 0)[0]
+            if mask.numel() == 0:
+                continue
+
+            kwargs = {}
+            if isinstance(self._embedding, PyannoteAudioPretrainedSpeakerEmbedding):
+                # per-row chunk id (normalized to start at 0) so the embedding can
+                # run fbank+ResNet once per unique chunk waveform
+                kwargs["repeat_masks"] = (
+                    chunk_idx_batch[mask] - chunk_idx_batch[mask].min()
+                )
 
             embedding_batch: np.ndarray = self._embedding(
-                waveform_batch, masks=mask_batch
+                waveform_batch[mask],
+                masks=mask_batch[mask],
+                **kwargs,
             )
-            # (batch_size, dimension) np.ndarray
+            # (num_non_empty, dimension) np.ndarray
 
-            embedding_batches.append(embedding_batch)
+            # scatter results back to their global (chunk, speaker) slots
+            embedding_batches[sample_idx_batch[mask].numpy()] = embedding_batch
 
             if hook is not None:
                 hook("embeddings", embedding_batch, total=batch_count, completed=i)
-
-        embedding_batches = np.vstack(embedding_batches)
 
         embeddings = rearrange(embedding_batches, "(c s) d -> c s d", c=num_chunks)
 

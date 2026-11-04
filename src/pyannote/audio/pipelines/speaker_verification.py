@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import contextlib
 import warnings
 from functools import cached_property
 from pathlib import Path
@@ -60,6 +61,26 @@ try:
     ONNX_IS_AVAILABLE = True
 except ImportError:
     ONNX_IS_AVAILABLE = False
+
+
+# bfloat16/float16 embedding-inference support (BSI speaker-embedding-optimizations,
+# ported from the pyannote 3.x fork). Runs the embedding forward under autocast for
+# a ~1.5-2x speedup / lower memory, keeping feature extraction in fp32.
+DTYPE_NAME_TO_CLS = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _maybe_autocast(device_type: str, dtype: torch.dtype):
+    """Autocast context for low-precision inference. For float32 we return a
+    no-op context rather than `torch.autocast(..., enabled=False)`: merely
+    *entering* an autocast context disables the fast TF32/cuDNN conv paths and
+    slows fp32 inference ~2-3x, so the default (float32) must avoid it entirely."""
+    if dtype == torch.float32:
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device_type, dtype=dtype)
 
 
 class NeMoPretrainedSpeakerEmbedding(BaseInference):
@@ -234,6 +255,7 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
         device: Optional[torch.device] = None,
         token: Union[Text, None] = None,
         cache_dir: Union[Path, Text, None] = None,
+        dtype: Text = "float32",
     ):
         if not SPEECHBRAIN_IS_AVAILABLE:
             raise ImportError(
@@ -242,6 +264,7 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
             )
 
         super().__init__()
+        self.dtype = DTYPE_NAME_TO_CLS[dtype]
         if "@" in embedding:
             self.embedding = embedding.split("@")[0]
             self.revision = embedding.split("@")[1]
@@ -310,6 +333,47 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
 
         return upper
 
+    def encode_batch(
+        self,
+        wavs: torch.Tensor,
+        wav_lens: torch.Tensor,
+        normalize: bool = False,
+    ):
+        """Override speechbrain EncoderClassifier.encode_batch to run the embedding
+        model under autocast (BSI optimization). Wrapping the *entire* encode_batch
+        in autocast is problematic because some parts (e.g. compute_features) suffer
+        from numerical instabilities, so only the embedding_model forward is
+        autocast; feature extraction and mean/var norm stay in fp32.
+
+        With dtype=float32 this is numerically identical to the upstream
+        classifier_.encode_batch call.
+        """
+
+        if len(wavs.shape) == 1:
+            wavs = wavs.unsqueeze(0)
+
+        # assign full length if wav_lens is not assigned
+        if wav_lens is None:
+            wav_lens = torch.ones(wavs.shape[0], device=self.device)
+
+        # store waveform on the specified device
+        wavs, wav_lens = wavs.to(self.device), wav_lens.to(self.device)
+        wavs = wavs.float()
+
+        # compute features and embeddings (features stay in fp32)
+        feats = self.classifier_.mods.compute_features(wavs)
+        feats = self.classifier_.mods.mean_var_norm(feats, wav_lens)
+
+        # autocast only when a low-precision dtype is requested (no-op at float32)
+        with _maybe_autocast(self.device.type, self.dtype):
+            embeddings = self.classifier_.mods.embedding_model(feats, wav_lens)
+
+        if normalize:
+            embeddings = self.classifier_.hparams.mean_var_norm_emb(
+                embeddings, torch.ones(embeddings.shape[0], device=self.device)
+            )
+        return embeddings
+
     def __call__(
         self, waveforms: torch.Tensor, masks: Optional[torch.Tensor] = None
     ) -> np.ndarray:
@@ -372,7 +436,8 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
         wav_lens[too_short] = 1.0
 
         embeddings = (
-            self.classifier_.encode_batch(signals, wav_lens=wav_lens)
+            self.encode_batch(signals, wav_lens=wav_lens)
+            .to(torch.float32)
             .squeeze(dim=1)
             .cpu()
             .numpy()
@@ -654,10 +719,12 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
         device: Optional[torch.device] = None,
         token: Union[Text, None] = None,
         cache_dir: Union[Path, Text, None] = None,
+        dtype: Text = "float32",
     ):
         super().__init__()
         self.embedding = embedding
         self.device = device or torch.device("cpu")
+        self.dtype = DTYPE_NAME_TO_CLS[dtype]
 
         self.model_: Model = get_model(self.embedding, token=token, cache_dir=cache_dir)
         self.model_.eval()
@@ -702,18 +769,69 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
         return upper
 
     def __call__(
-        self, waveforms: torch.Tensor, masks: Optional[torch.Tensor] = None
+        self,
+        waveforms: torch.Tensor,
+        masks: Optional[torch.Tensor] = None,
+        repeat_masks: Optional[torch.Tensor] = None,
     ) -> np.ndarray:
+        waveforms = waveforms.to(self.device)
+        masks = masks.to(self.device) if masks is not None else None
+
+        # The `repeat_masks` de-duplication only pays off under low precision:
+        # it trades the ResNet's conv compute for a memory-heavy frame gather,
+        # which is a net loss in fp32 (~2x slower) but a win in bf16/fp16 where
+        # the conv dominates. At float32 (the default) fall back to the plain
+        # upstream forward so behaviour and speed match stock exactly.
+        use_dedup = repeat_masks is not None and self.dtype != torch.float32
+
         with torch.inference_mode():
             if masks is None:
-                embeddings = self.model_(waveforms.to(self.device))
-            else:
+                embeddings = self.model_(waveforms)
+
+            elif not use_dedup:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    embeddings = self.model_(
-                        waveforms.to(self.device), weights=masks.to(self.device)
+                    embeddings = self.model_(waveforms, weights=masks)
+
+            else:
+                # BSI optimization: several speaker masks share the same chunk
+                # waveform, so run the expensive fbank + ResNet frame extraction
+                # ONCE per unique waveform, then expand the frames back per-mask
+                # before the (cheap) pooling/embedding head. `repeat_masks` holds
+                # the chunk id for each row, grouped so equal ids are contiguous
+                # and appear in increasing order. As in the SpeechBrain path, only
+                # the ResNet runs under autocast; fbank stays in fp32 to avoid
+                # numerical instabilities.
+                repeat_masks = repeat_masks.to(self.device)
+
+                # first-occurrence index of each unique (contiguous) chunk id
+                starting_idx = (
+                    repeat_masks[1:] != repeat_masks[:-1]
+                ).nonzero(as_tuple=True)[0] + 1
+                starting_idx = torch.cat(
+                    (
+                        torch.zeros(1, dtype=torch.long, device=self.device),
+                        starting_idx,
                     )
-        return embeddings.cpu().numpy()
+                )
+
+                waveforms_dedup = waveforms[starting_idx]
+                fbank = self.model_.compute_fbank(waveforms_dedup)
+                # autocast only when a low-precision dtype is requested (no-op at fp32)
+                with _maybe_autocast(self.device.type, self.dtype):
+                    frames = self.model_.resnet.forward_frames(fbank)
+
+                # duplicate frames back to one row per mask, then pool per-mask
+                _, inv_idx = torch.unique(
+                    repeat_masks, sorted=True, return_inverse=True
+                )
+                frames = frames[inv_idx]
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    embeddings = self.model_.forward_embedding(frames, weights=masks)
+
+        # cast back to fp32 so downstream clustering (PLDA/VBx) always sees float32
+        return embeddings.float().cpu().numpy()
 
 
 def PretrainedSpeakerEmbedding(
@@ -721,6 +839,7 @@ def PretrainedSpeakerEmbedding(
     device: Optional[torch.device] = None,
     token: Union[Text, None] = None,
     cache_dir: Union[Path, Text, None] = None,
+    dtype: Text = "float32",
 ):
     """Pretrained speaker embedding
 
@@ -735,6 +854,10 @@ def PretrainedSpeakerEmbedding(
         Huggingface token to be used for downloading from Huggingface hub.
     cache_dir: Path or str, optional
         Path to the folder where files downloaded from Huggingface hub are stored.
+    dtype : {"float32", "float16", "bfloat16"}, optional
+        Autocast dtype for the embedding forward pass (BSI optimization).
+        Defaults to "float32" (upstream behaviour). Only honoured by the
+        pyannote.audio and SpeechBrain embedding backends.
 
     Usage
     -----
@@ -755,12 +878,12 @@ def PretrainedSpeakerEmbedding(
 
     if isinstance(embedding, str) and "pyannote" in embedding:
         return PyannoteAudioPretrainedSpeakerEmbedding(
-            embedding, device=device, token=token, cache_dir=cache_dir
+            embedding, device=device, token=token, cache_dir=cache_dir, dtype=dtype
         )
 
     elif isinstance(embedding, str) and "speechbrain" in embedding:
         return SpeechBrainPretrainedSpeakerEmbedding(
-            embedding, device=device, token=token, cache_dir=cache_dir
+            embedding, device=device, token=token, cache_dir=cache_dir, dtype=dtype
         )
 
     elif isinstance(embedding, str) and "nvidia" in embedding:
@@ -773,8 +896,9 @@ def PretrainedSpeakerEmbedding(
 
     else:
         # fallback to pyannote in case we are loading a local model
+        # (community-1's native WeSpeaker ResNet34 lands here)
         return PyannoteAudioPretrainedSpeakerEmbedding(
-            embedding, device=device, token=token, cache_dir=cache_dir
+            embedding, device=device, token=token, cache_dir=cache_dir, dtype=dtype
         )
 
 
