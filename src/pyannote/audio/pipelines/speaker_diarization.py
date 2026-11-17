@@ -52,7 +52,7 @@ from pyannote.audio.pipelines.utils import (
 )
 from pyannote.audio.pipelines.utils.diarization import set_num_speakers
 from pyannote.audio.utils.signal import binarize
-from pyannote.core import Annotation, SlidingWindow, SlidingWindowFeature
+from pyannote.core import Annotation, SlidingWindowFeature
 from pyannote.metrics.diarization import GreedyDiarizationErrorRate
 from pyannote.pipeline.parameter import ParamDict, Uniform
 
@@ -70,15 +70,15 @@ class SpeakerScores:
 
     soft_clusters[c, s, k] is how close local speaker s of chunk c is to cluster k
     (2 - distance to the centroid); hard_clusters[c, s] is the cluster it was
-    assigned to (-2 when inactive). frames is the resolution of the discrete
-    diarization, whose speaker k is cluster k. labels maps cluster k to its speaker
-    label in speaker_diarization (clusters without speech are left out).
+    assigned to (-2 when inactive). discrete_diarization is the (num_frames,
+    num_clusters) frame-level diarization behind speaker_diarization. labels maps
+    cluster k to its speaker label (clusters without speech are left out).
     """
 
     soft_clusters: np.ndarray
     hard_clusters: np.ndarray
     segmentations: SlidingWindowFeature
-    frames: SlidingWindow
+    discrete_diarization: SlidingWindowFeature
     labels: dict[int, Any]
 
 
@@ -832,7 +832,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             soft_clusters=np.asarray(soft_clusters, dtype=np.float32),
             hard_clusters=hard_clusters,
             segmentations=binarized_segmentations,
-            frames=discrete_diarization.sliding_window,
+            discrete_diarization=discrete_diarization,
             labels=dict(mapping),
         )
 
