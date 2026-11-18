@@ -65,6 +65,24 @@ def batchify(iterable, batch_size: int = 32, fillvalue=None):
 
 
 @dataclass
+class SpeakerScores:
+    """Clustering scores behind the diarization, to derive per-speaker confidences.
+
+    soft_clusters[c, s, k] is how close local speaker s of chunk c is to cluster k
+    (2 - distance to the centroid); hard_clusters[c, s] is the cluster it was
+    assigned to (-2 when inactive). discrete_diarization is the (num_frames,
+    num_clusters) frame-level diarization behind speaker_diarization. labels maps
+    cluster k to its speaker label (clusters without speech are left out).
+    """
+
+    soft_clusters: np.ndarray
+    hard_clusters: np.ndarray
+    segmentations: SlidingWindowFeature
+    discrete_diarization: SlidingWindowFeature
+    labels: dict[int, Any]
+
+
+@dataclass
 class DiarizeOutput:
     # speaker diarization
     speaker_diarization: Annotation
@@ -77,6 +95,9 @@ class DiarizeOutput:
     # as (num_speakers, dimension) array
     # sorted in speaker_diarization.labels() order
     speaker_embeddings: np.ndarray | None = None
+
+    # clustering scores, None when no speaker is active
+    speaker_scores: SpeakerScores | None = None
 
 
     def serialize(self) -> dict[str, Any]:
@@ -705,7 +726,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         hook("embeddings", embeddings)
         #   shape: (num_chunks, local_num_speakers, dimension)
 
-        hard_clusters, _, centroids = self.clustering(
+        hard_clusters, soft_clusters, centroids = self.clustering(
             embeddings=embeddings,
             segmentations=binarized_segmentations,
             num_clusters=num_speakers,
@@ -807,6 +828,14 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         diarization = diarization.rename_labels(mapping=mapping)
         exclusive_diarization = exclusive_diarization.rename_labels(mapping=mapping)
 
+        speaker_scores = SpeakerScores(
+            soft_clusters=np.asarray(soft_clusters, dtype=np.float32),
+            hard_clusters=hard_clusters,
+            segmentations=binarized_segmentations,
+            discrete_diarization=discrete_diarization,
+            labels=dict(mapping),
+        )
+
         # at this point, `diarization` speaker labels are strings (or mix of
         # strings and integers when reference is available and some hypothesis
         # speakers are not present in the reference)
@@ -817,6 +846,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                 speaker_diarization=diarization,
                 exclusive_speaker_diarization=exclusive_diarization,
                 speaker_embeddings=centroids,
+                speaker_scores=speaker_scores,
             )
             if self.legacy:
                 return output.speaker_diarization
@@ -844,6 +874,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             speaker_diarization=diarization,
             exclusive_speaker_diarization=exclusive_diarization,
             speaker_embeddings=centroids,
+            speaker_scores=speaker_scores,
         )
 
         if self.legacy:
